@@ -12,6 +12,7 @@ import (
 	"github.com/bonjoski/shield/pkg/provider"
 	"github.com/bonjoski/shield/pkg/proxy"
 	"github.com/bonjoski/shield/pkg/shield"
+	"github.com/bonjoski/shield/pkg/version"
 )
 
 func main() {
@@ -28,7 +29,7 @@ func main() {
 	case "redact":
 		runRedact(os.Args[2:])
 	case "version":
-		fmt.Println("shield v1.0.0 (bonjoski sovereign BYO-AI shield)")
+		fmt.Printf("shield %s (bonjoski sovereign BYO-AI shield)\n", version.Version)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
