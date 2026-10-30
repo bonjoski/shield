@@ -1,0 +1,155 @@
+package provider
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type ClaudeProvider struct {
+	apiKey     string
+	model      string
+	httpClient *http.Client
+	baseURL    string
+}
+
+func NewClaudeProvider(apiKey string, model string) *ClaudeProvider {
+	if model == "" {
+		model = "claude-3-5-sonnet-20241022"
+	}
+	return &ClaudeProvider{
+		apiKey:     apiKey,
+		model:      model,
+		httpClient: &http.Client{Timeout: 60 * time.Second},
+		baseURL:    "https://api.anthropic.com/v1",
+	}
+}
+
+func (c *ClaudeProvider) Name() string {
+	return "anthropic-claude"
+}
+
+type claudeMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type claudeRequest struct {
+	Model       string          `json:"model"`
+	MaxTokens   int             `json:"max_tokens"`
+	System      string          `json:"system,omitempty"`
+	Messages    []claudeMessage `json:"messages"`
+	Temperature float64         `json:"temperature,omitempty"`
+}
+
+type claudeContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type claudeResponse struct {
+	ID         string               `json:"id"`
+	Type       string               `json:"type"`
+	Role       string               `json:"role"`
+	Content    []claudeContentBlock `json:"content"`
+	StopReason string               `json:"stop_reason"`
+	Usage      struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func (c *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, error) {
+	if c.apiKey == "" {
+		return nil, fmt.Errorf("%w: ANTHROPIC_API_KEY is not configured", ErrProviderFailed)
+	}
+
+	model := req.Model
+	if model == "" {
+		model = c.model
+	}
+
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 4096
+	}
+
+	cReq := claudeRequest{
+		Model:       model,
+		MaxTokens:   maxTokens,
+		System:      req.SystemPrompt,
+		Temperature: req.Temperature,
+		Messages:    make([]claudeMessage, 0, len(req.Messages)),
+	}
+
+	for _, msg := range req.Messages {
+		if msg.Role == RoleSystem {
+			cReq.System = msg.Content
+			continue
+		}
+		cReq.Messages = append(cReq.Messages, claudeMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	bodyBytes, err := json.Marshal(cReq)
+	if err != nil {
+		return nil, fmt.Errorf("claude marshal error: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/messages", c.baseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("claude request creation failed: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", c.apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProviderFailed, err)
+	}
+	defer httpResp.Body.Close()
+
+	respBytes, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("claude read response failed: %w", err)
+	}
+
+	var cResp claudeResponse
+	if err := json.Unmarshal(respBytes, &cResp); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+
+	if cResp.Error != nil {
+		return nil, fmt.Errorf("%w: API error (%s): %s", ErrProviderFailed, cResp.Error.Type, cResp.Error.Message)
+	}
+
+	var texts []string
+	for _, block := range cResp.Content {
+		if block.Type == "text" {
+			texts = append(texts, block.Text)
+		}
+	}
+
+	return &Response{
+		Content:      strings.Join(texts, "\n"),
+		Model:        model,
+		FinishReason: cResp.StopReason,
+		Usage: TokenUsage{
+			InputTokens:  cResp.Usage.InputTokens,
+			OutputTokens: cResp.Usage.OutputTokens,
+		},
+	}, nil
+}
