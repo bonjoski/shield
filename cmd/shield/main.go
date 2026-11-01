@@ -42,13 +42,27 @@ func printUsage() {
 
 Commands:
   proxy    Start the client-side secret shield loopback proxy (for Cursor, Claude Code, Antigravity)
+           Flags:
+             --addr <addr>        TCP address to bind (default: 127.0.0.1:8080)
+             --socket <path>      Unix domain socket path (e.g. ~/.shield/shield.sock)
+             --tls                Enable trusted HTTPS listener
+             --cert <path>        Server TLS certificate (default: ~/.locksmith/certs/server.crt)
+             --key <path>         Server TLS private key (default: ~/.locksmith/certs/server.key)
+             --client-ca <path>   Client CA certificate for mTLS mutual verification
+             --provider <name>    AI Provider (gemini, claude, openai, ollama, mock)
+             --model <model>      Model override
   redact   Scrub and tokenize secrets from a text stream or file
   version  Print shield version`)
 }
 
 func runProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:8080", "Address to bind proxy server")
+	addr := fs.String("addr", "127.0.0.1:8080", "TCP address to bind proxy server (when not using --socket)")
+	socket := fs.String("socket", "", "Unix domain socket path to bind (e.g. ~/.shield/shield.sock)")
+	tlsEnabled := fs.Bool("tls", false, "Enable HTTPS / TLS listener")
+	cert := fs.String("cert", "", "Path to TLS server certificate PEM (defaults to ~/.locksmith/certs/server.crt if exists)")
+	key := fs.String("key", "", "Path to TLS server private key PEM (defaults to ~/.locksmith/certs/server.key if exists)")
+	clientCA := fs.String("client-ca", "", "Path to Client CA certificate PEM for mTLS verification")
 	providerName := fs.String("provider", "mock", "AI Provider to route to (gemini, claude, openai, ollama, mock)")
 	model := fs.String("model", "", "Model name override")
 	_ = fs.Parse(args)
@@ -67,11 +81,48 @@ func runProxy(args []string) {
 		prov = provider.NewMockProvider("mock-ai", "Shield loopback proxy response.")
 	}
 
-	engine := shield.NewEngine(shield.DefaultConfig())
-	srv := proxy.NewServer(*addr, engine, prov)
+	opts := proxy.Options{
+		Addr:       *addr,
+		SocketPath: *socket,
+		TLS:        *tlsEnabled,
+		CertFile:   *cert,
+		KeyFile:    *key,
+		ClientCA:   *clientCA,
+	}
 
-	fmt.Printf("[SHIELD] Starting sovereign BYO-AI loopback proxy on %s (upstream: %s)...\n", *addr, prov.Name())
-	fmt.Printf("[SHIELD] In Cursor / Claude Code, set Base URL to: http://%s/v1\n", *addr)
+	if *cert != "" || *key != "" {
+		opts.TLS = true
+	}
+
+	if opts.SocketPath == "" && !opts.TLS {
+		defaultCert := proxy.DefaultCertPath()
+		defaultKey := proxy.DefaultKeyPath()
+		if _, err1 := os.Stat(defaultCert); err1 == nil {
+			if _, err2 := os.Stat(defaultKey); err2 == nil {
+				fmt.Println("[SHIELD] [INFO] Locksmith root-anchored certificates found at ~/.locksmith/certs/server.crt. Use --tls to activate trusted HTTPS.")
+			}
+		}
+	}
+
+	engine := shield.NewEngine(shield.DefaultConfig())
+	srv := proxy.NewServerWithOptions(opts, engine, prov)
+
+	if opts.SocketPath != "" {
+		expandedSock := proxy.ExpandPath(opts.SocketPath)
+		fmt.Printf("[SHIELD] Starting sovereign BYO-AI Unix socket proxy on %s (upstream: %s)...\n", expandedSock, prov.Name())
+		fmt.Printf("[SHIELD] Unix domain socket mode active. No open TCP/HTTP network ports.\n")
+		fmt.Printf("[SHIELD] For socket-compatible clients: curl --unix-socket %s http://localhost/v1/...\n", expandedSock)
+	} else if opts.TLS {
+		fmt.Printf("[SHIELD] Starting sovereign BYO-AI HTTPS proxy on %s (upstream: %s)...\n", *addr, prov.Name())
+		fmt.Printf("[SHIELD] In Cursor / Claude Code, set Base URL to: https://%s/v1\n", *addr)
+		if opts.ClientCA != "" {
+			fmt.Printf("[SHIELD] mTLS Client Certificate verification active (CA: %s)\n", opts.ClientCA)
+		}
+	} else {
+		fmt.Printf("[SHIELD] Starting sovereign BYO-AI HTTP loopback proxy on %s (upstream: %s)...\n", *addr, prov.Name())
+		fmt.Printf("[SHIELD] [WARNING] Plaintext HTTP active. For zero-trust local isolation, use --socket or --tls.\n")
+		fmt.Printf("[SHIELD] In Cursor / Claude Code, set Base URL to: http://%s/v1\n", *addr)
+	}
 
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start proxy: %v\n", err)
