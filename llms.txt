@@ -1,0 +1,20 @@
+# Shield
+
+> Sovereign Client-Side Secret Shielding & Fail-Closed Wire Guard for AI Agents.
+
+## Core Capabilities
+- Deterministic Secret Tokenization: Replaces sensitive credentials with fixed-width cryptographic placeholders (`[SECRET_REF_...]`) before transmission to cloud LLMs (Gemini, Claude, OpenAI).
+- Fail-Closed Wire Guard: Hardware/transport-level pre-flight scan that halts outbound HTTP calls if an unmasked secret slips into network egress buffers.
+- Shannon Entropy Scanning: Detects raw high-entropy strings (>4.2 bits/char) to catch unformatted keys and credentials.
+- Invisible Unicode Smuggling Defense: Strips zero-width spaces (`\u200b`, `\u200c`, `\ufeff`) used in evasion attacks.
+- AST Reassembly & Verification: Validates syntax of generated code using language ASTs (`go/parser`) to prevent token corruption.
+- Loopback Proxy: Zero-code drop-in proxy on `127.0.0.1:8080` for Antigravity, Claude Code, Cursor, and Windsurf.
+
+## CLI Usage
+- `shield proxy --port 8080`: Starts local loopback proxy.
+- `shield redact "<text>"`: Manually redacts strings or files.
+- `shield verify --file <path>`: Verifies syntactic validity of de-tokenized code.
+
+## Endpoints & Documentation
+- Proxy Endpoint: `http://127.0.0.1:8080/v1/chat/completions`
+- Documentation: `docs/knowledge-base/06-shield.md` in repo `spanreed`
