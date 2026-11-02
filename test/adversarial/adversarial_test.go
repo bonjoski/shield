@@ -8,11 +8,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -533,6 +536,160 @@ func TestADV11_PostQuantumKeyExchangeDowngradeResistance(t *testing.T) {
 	}
 }
 
+// ADV-12: SPIFFE SVID Identity Spoofing & Authorization Bypass Mitigation
+// Adversary attempts:
+// 1. Rogue CA self-signed cert with an authorized SPIFFE ID -> Rejected at mTLS layer.
+// 2. Legitimate CA cert with unauthorized SPIFFE ID -> Rejected with 403 {"error": "unauthorized spiffe id"}.
+// 3. Legitimate CA cert without SPIFFE URI SAN (e.g. DNS or HTTPS SAN) -> Rejected with 403 {"error": "spiffe uri san required"}.
+// 4. Prefix confusion attack (e.g. spiffe://bonjoski.local/ns/dev-evil vs spiffe://bonjoski.local/ns/dev/*) -> Rejected.
+// 5. Plaintext connection attempt without client cert -> Rejected with 403 {"error": "client certificate required"}.
+// 6. Legitimate client with matching SPIFFE ID -> Accepted with 200 OK.
+func TestADV12_SPIFFEAuthorizationAndSVIDSpoofing(t *testing.T) {
+	tempDir := t.TempDir()
+	caCertPEM, caKeyPEM := generateTestCA(t, "Locksmith Root CA")
+	rogueCACertPEM, rogueCAKeyPEM := generateTestCA(t, "Rogue Attacker CA")
+
+	serverCertPEM, serverKeyPEM := generateTestCert(t, caCertPEM, caKeyPEM, true, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")})
+
+	certFile := filepath.Join(tempDir, "server.crt")
+	keyFile := filepath.Join(tempDir, "server.key")
+	caFile := filepath.Join(tempDir, "ca.crt")
+	_ = os.WriteFile(certFile, serverCertPEM, 0600)
+	_ = os.WriteFile(keyFile, serverKeyPEM, 0600)
+	_ = os.WriteFile(caFile, caCertPEM, 0644)
+
+	engine := shield.NewEngine(shield.DefaultConfig())
+	mock := provider.NewMockProvider("mock-ai", "Protected secret completion.")
+
+	allowedPattern := "spiffe://bonjoski.local/ns/dev/*"
+	srv := proxy.NewServerWithOptions(proxy.Options{
+		Addr:             "127.0.0.1:0",
+		TLS:              true,
+		CertFile:         certFile,
+		KeyFile:          keyFile,
+		ClientCA:         caFile,
+		AllowedSPIFFEIDs: []string{allowedPattern},
+	}, engine, mock)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop(context.Background())
+
+	addr := srv.ListenerAddr().String()
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caCertPEM)
+
+	makeReq := func(client *http.Client) (*http.Response, map[string]interface{}, error) {
+		reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"test"}]}`
+		resp, err := client.Post("https://"+addr+"/v1/chat/completions", "application/json", strings.NewReader(reqPayload))
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		var parsed map[string]interface{}
+		_ = json.Unmarshal(bodyBytes, &parsed)
+		return resp, parsed, nil
+	}
+
+	// 1. Rogue CA cert spoofing authorized SPIFFE ID
+	devURL, _ := url.Parse("spiffe://bonjoski.local/ns/dev/sa/payment-api")
+	rogueClientCertPEM, rogueClientKeyPEM := generateTestCertWithURIs(t, rogueCACertPEM, rogueCAKeyPEM, false, nil, nil, []*url.URL{devURL})
+	rogueTLSCert, _ := tls.X509KeyPair(rogueClientCertPEM, rogueClientKeyPEM)
+	rogueClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{rogueTLSCert},
+			},
+		},
+	}
+	_, _, err := makeReq(rogueClient)
+	if err == nil {
+		t.Errorf("ADV-12 FAILED: Rogue CA certificate was accepted during TLS handshake")
+	}
+
+	// 2. Legitimate CA cert with unauthorized SPIFFE ID (prod namespace)
+	prodURL, _ := url.Parse("spiffe://bonjoski.local/ns/prod/sa/payment-api")
+	unauthCertPEM, unauthKeyPEM := generateTestCertWithURIs(t, caCertPEM, caKeyPEM, false, nil, nil, []*url.URL{prodURL})
+	unauthTLSCert, _ := tls.X509KeyPair(unauthCertPEM, unauthKeyPEM)
+	unauthClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{unauthTLSCert},
+			},
+		},
+	}
+	resp, body, err := makeReq(unauthClient)
+	if err != nil {
+		t.Fatalf("unexpected network error: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden || body["error"] != "unauthorized spiffe id" {
+		t.Errorf("ADV-12 FAILED: Expected 403 'unauthorized spiffe id', got status %d, body %v", resp.StatusCode, body)
+	}
+
+	// 3. Legitimate CA cert with prefix confusion attack (ns/dev-evil vs ns/dev/*)
+	evilURL, _ := url.Parse("spiffe://bonjoski.local/ns/dev-evil/sa/app")
+	evilCertPEM, evilKeyPEM := generateTestCertWithURIs(t, caCertPEM, caKeyPEM, false, nil, nil, []*url.URL{evilURL})
+	evilTLSCert, _ := tls.X509KeyPair(evilCertPEM, evilKeyPEM)
+	evilClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{evilTLSCert},
+			},
+		},
+	}
+	resp, body, err = makeReq(evilClient)
+	if err != nil {
+		t.Fatalf("unexpected network error: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden || body["error"] != "unauthorized spiffe id" {
+		t.Errorf("ADV-12 FAILED: Prefix confusion attack bypassed ACL: got status %d, body %v", resp.StatusCode, body)
+	}
+
+	// 4. Legitimate CA cert without SPIFFE URI in SAN (HTTPS URI scheme instead)
+	httpsURL, _ := url.Parse("https://bonjoski.local/ns/dev/sa/payment-api")
+	nonSpiffeCertPEM, nonSpiffeKeyPEM := generateTestCertWithURIs(t, caCertPEM, caKeyPEM, false, nil, nil, []*url.URL{httpsURL})
+	nonSpiffeTLSCert, _ := tls.X509KeyPair(nonSpiffeCertPEM, nonSpiffeKeyPEM)
+	nonSpiffeClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{nonSpiffeTLSCert},
+			},
+		},
+	}
+	resp, body, err = makeReq(nonSpiffeClient)
+	if err != nil {
+		t.Fatalf("unexpected network error: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden || body["error"] != "spiffe uri san required" {
+		t.Errorf("ADV-12 FAILED: Non-SPIFFE URI was accepted: got status %d, body %v", resp.StatusCode, body)
+	}
+
+	// 5. Legitimate client with matching SPIFFE ID
+	legitCertPEM, legitKeyPEM := generateTestCertWithURIs(t, caCertPEM, caKeyPEM, false, nil, nil, []*url.URL{devURL})
+	legitTLSCert, _ := tls.X509KeyPair(legitCertPEM, legitKeyPEM)
+	legitClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{legitTLSCert},
+			},
+		},
+	}
+	resp, body, err = makeReq(legitClient)
+	if err != nil {
+		t.Fatalf("unexpected network error: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("ADV-12 FAILED: Legitimate SPIFFE client rejected with %d: %v", resp.StatusCode, body)
+	}
+}
+
 // Helpers for ephemeral adversarial test certificates
 func generateTestCA(t *testing.T, commonName string) ([]byte, []byte) {
 	t.Helper()
@@ -594,6 +751,59 @@ func generateTestCert(t *testing.T, caCertPEM, caKeyPEM []byte, isServer bool, d
 		},
 		NotBefore: time.Now().Add(-1 * time.Hour),
 		NotAfter:  time.Now().Add(24 * time.Hour),
+	}
+
+	if isServer {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		tmpl.DNSNames = dnsNames
+		tmpl.IPAddresses = ips
+	} else {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &certKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, _ := x509.MarshalECPrivateKey(certKey)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+
+	return certPEM, keyPEM
+}
+
+func generateTestCertWithURIs(t *testing.T, caCertPEM, caKeyPEM []byte, isServer bool, dnsNames []string, ips []net.IP, uris []*url.URL) ([]byte, []byte) {
+	t.Helper()
+
+	caBlock, _ := pem.Decode(caCertPEM)
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caKeyBlock, _ := pem.Decode(caKeyPEM)
+	caKey, err := x509.ParseECPrivateKey(caKeyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "Shield Adversarial SPIFFE Test Cert",
+		},
+		NotBefore: time.Now().Add(-1 * time.Hour),
+		NotAfter:  time.Now().Add(24 * time.Hour),
+		URIs:      uris,
 	}
 
 	if isServer {

@@ -30,12 +30,13 @@ var (
 
 // Options configures the proxy server listeners and security parameters.
 type Options struct {
-	Addr       string // TCP address to bind (e.g. "127.0.0.1:8080" or "127.0.0.1:8443")
-	SocketPath string // Unix domain socket path (e.g. "~/.shield/shield.sock")
-	TLS        bool   // Enable TLS / HTTPS listener
-	CertFile   string // Path to server certificate PEM
-	KeyFile    string // Path to server private key PEM
-	ClientCA   string // Path to client CA PEM for mTLS client verification
+	Addr             string   // TCP address to bind (e.g. "127.0.0.1:8080" or "127.0.0.1:8443")
+	SocketPath       string   // Unix domain socket path (e.g. "~/.shield/shield.sock")
+	TLS              bool     // Enable TLS / HTTPS listener
+	CertFile         string   // Path to server certificate PEM
+	KeyFile          string   // Path to server private key PEM
+	ClientCA         string   // Path to client CA PEM for mTLS client verification
+	AllowedSPIFFEIDs []string // Allowed SPIFFE IDs or wildcard patterns (e.g. "spiffe://bonjoski.local/ns/dev/*")
 }
 
 // Server implements a local loopback reverse proxy providing client-side secret shielding
@@ -143,8 +144,8 @@ func (s *Server) Start() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.handleOpenAI)
-	mux.HandleFunc("/v1/messages", s.handleAnthropic)
+	mux.Handle("/v1/chat/completions", s.authorizeSPIFFE(http.HandlerFunc(s.handleOpenAI)))
+	mux.Handle("/v1/messages", s.authorizeSPIFFE(http.HandlerFunc(s.handleAnthropic)))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"healthy","shield":"active"}`))
@@ -252,6 +253,9 @@ func (s *Server) Start() error {
 			}
 			tlsConfig.ClientCAs = clientPool
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		} else if len(s.opts.AllowedSPIFFEIDs) > 0 {
+			// Request client certificates when SPIFFE ACL is active without explicit ClientCA
+			tlsConfig.ClientAuth = tls.RequestClientCert
 		}
 
 		l = tls.NewListener(l, tlsConfig)
@@ -391,4 +395,83 @@ func (s *Server) handleOpenAI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	// Analogous handling for Anthropic /v1/messages
 	s.handleOpenAI(w, r)
+}
+
+// AuthorizeSPIFFE wraps an http.Handler with SPIFFE ID authorization checks based on AllowedSPIFFEIDs.
+func (s *Server) AuthorizeSPIFFE(next http.Handler) http.Handler {
+	return s.authorizeSPIFFE(next)
+}
+
+func (s *Server) authorizeSPIFFE(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.opts.AllowedSPIFFEIDs) > 0 {
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "client certificate required",
+				})
+				return
+			}
+
+			peerCert := r.TLS.PeerCertificates[0]
+			var spiffeIDs []string
+			for _, u := range peerCert.URIs {
+				if u != nil && strings.EqualFold(u.Scheme, "spiffe") {
+					spiffeIDs = append(spiffeIDs, u.String())
+				}
+			}
+
+			if len(spiffeIDs) == 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error": "spiffe uri san required",
+				})
+				return
+			}
+
+			matched := false
+			for _, id := range spiffeIDs {
+				if matchSPIFFEID(id, s.opts.AllowedSPIFFEIDs) {
+					matched = true
+					break
+				}
+			}
+
+			if !matched {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":     "unauthorized spiffe id",
+					"spiffe_id": spiffeIDs[0],
+				})
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// matchSPIFFEID returns true if clientID matches any pattern in patterns.
+// Patterns support exact match and trailing wildcard match (e.g. "spiffe://bonjoski.local/ns/dev/*").
+func matchSPIFFEID(clientID string, patterns []string) bool {
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		if strings.HasSuffix(pattern, "*") {
+			prefix := strings.TrimSuffix(pattern, "*")
+			if strings.HasPrefix(clientID, prefix) {
+				return true
+			}
+		} else {
+			if clientID == pattern {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/bonjoski/shield/pkg/provider"
@@ -14,6 +15,25 @@ import (
 	"github.com/bonjoski/shield/pkg/shield"
 	"github.com/bonjoski/shield/pkg/version"
 )
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(val string) error {
+	for _, part := range strings.Split(val, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			*s = append(*s, trimmed)
+		}
+	}
+	return nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,14 +63,16 @@ func printUsage() {
 Commands:
   proxy    Start the client-side secret shield loopback proxy (for Cursor, Claude Code, Antigravity)
            Flags:
-             --addr <addr>        TCP address to bind (default: 127.0.0.1:8080)
-             --socket <path>      Unix domain socket path (e.g. ~/.shield/shield.sock)
-             --tls                Enable trusted HTTPS listener
-             --cert <path>        Server TLS certificate (default: ~/.locksmith/certs/server.crt)
-             --key <path>         Server TLS private key (default: ~/.locksmith/certs/server.key)
-             --client-ca <path>   Client CA certificate for mTLS mutual verification
-             --provider <name>    AI Provider (gemini, claude, openai, ollama, mock)
-             --model <model>      Model override
+             --addr <addr>              TCP address to bind (default: 127.0.0.1:8080)
+             --socket <path>            Unix domain socket path (e.g. ~/.shield/shield.sock)
+             --tls                      Enable trusted HTTPS listener
+             --cert <path>              Server TLS certificate (default: ~/.locksmith/certs/server.crt)
+             --key <path>               Server TLS private key (default: ~/.locksmith/certs/server.key)
+             --client-ca <path>         Client CA certificate for mTLS mutual verification
+             --allowed-spiffe-id <id>   Allowed SPIFFE ID or wildcard pattern (repeatable or comma-separated)
+             --spiffe-acl <ids>         Comma-separated list of allowed SPIFFE IDs or wildcard patterns
+             --provider <name>          AI Provider (gemini, claude, openai, ollama, mock)
+             --model <model>            Model override
   redact   Scrub and tokenize secrets from a text stream or file
   version  Print shield version`)
 }
@@ -63,6 +85,9 @@ func runProxy(args []string) {
 	cert := fs.String("cert", "", "Path to TLS server certificate PEM (defaults to ~/.locksmith/certs/server.crt if exists)")
 	key := fs.String("key", "", "Path to TLS server private key PEM (defaults to ~/.locksmith/certs/server.key if exists)")
 	clientCA := fs.String("client-ca", "", "Path to Client CA certificate PEM for mTLS verification")
+	var allowedSPIFFEIDs stringSliceFlag
+	fs.Var(&allowedSPIFFEIDs, "allowed-spiffe-id", "Allowed SPIFFE ID or wildcard pattern (repeatable or comma-separated)")
+	fs.Var(&allowedSPIFFEIDs, "spiffe-acl", "Comma-separated list of allowed SPIFFE IDs or wildcard patterns")
 	providerName := fs.String("provider", "mock", "AI Provider to route to (gemini, claude, openai, ollama, mock)")
 	model := fs.String("model", "", "Model name override")
 	_ = fs.Parse(args)
@@ -82,12 +107,13 @@ func runProxy(args []string) {
 	}
 
 	opts := proxy.Options{
-		Addr:       *addr,
-		SocketPath: *socket,
-		TLS:        *tlsEnabled,
-		CertFile:   *cert,
-		KeyFile:    *key,
-		ClientCA:   *clientCA,
+		Addr:             *addr,
+		SocketPath:       *socket,
+		TLS:              *tlsEnabled,
+		CertFile:         *cert,
+		KeyFile:          *key,
+		ClientCA:         *clientCA,
+		AllowedSPIFFEIDs: allowedSPIFFEIDs,
 	}
 
 	if *cert != "" || *key != "" {
@@ -117,6 +143,9 @@ func runProxy(args []string) {
 		fmt.Printf("[SHIELD] In Cursor / Claude Code, set Base URL to: https://%s/v1\n", *addr)
 		if opts.ClientCA != "" {
 			fmt.Printf("[SHIELD] mTLS Client Certificate verification active (CA: %s)\n", opts.ClientCA)
+		}
+		if len(opts.AllowedSPIFFEIDs) > 0 {
+			fmt.Printf("[SHIELD] SPIFFE client certificate authorization active (%d allowed pattern(s))\n", len(opts.AllowedSPIFFEIDs))
 		}
 	} else {
 		fmt.Printf("[SHIELD] Starting sovereign BYO-AI HTTP loopback proxy on %s (upstream: %s)...\n", *addr, prov.Name())
