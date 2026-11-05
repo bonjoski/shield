@@ -4,7 +4,6 @@
 > **Role:** Lead Privacy & Secret Redaction Engineer  
 > **Ecosystem:** `bonjoski` Sovereign AI Agent Security Toolchain  
 > **Canonical GitHub Description:** *Sovereign client-side secret redactor and fail-closed HTTP wire guard proxy for AI coding agents with Shannon entropy scanning.*  
-> **Expert Runbook:** [`spanreed/docs/knowledge-base/06-shield.md`](file:///Users/benskolmoski/code/spanreed/docs/knowledge-base/06-shield.md)
 
 ---
 

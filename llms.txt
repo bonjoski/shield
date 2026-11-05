@@ -18,4 +18,4 @@
 ## Key Addresses & Paths
 - Loopback Proxy: `http://127.0.0.1:8080`
 - Health Endpoint: `http://127.0.0.1:8080/health`
-- Parent Runbook: `docs/knowledge-base/06-shield.md` in repository `spanreed`
+- Documentation: README.md & AGENTS.md

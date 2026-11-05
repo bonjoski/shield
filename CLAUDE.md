@@ -1,6 +1,5 @@
 # Claude Code Guidelines for `shield`
 
-> **Authoritative Ecosystem Runbook:** [`spanreed/docs/knowledge-base/06-shield.md`](file:///Users/benskolmoski/code/spanreed/docs/knowledge-base/06-shield.md)
 
 ## Build & Test Commands
 - **Build Binary:** `go build -o bin/shield ./cmd/shield`
