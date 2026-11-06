@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/bonjoski/shield/pkg/dbguard"
 	"github.com/bonjoski/shield/pkg/provider"
 	"github.com/bonjoski/shield/pkg/proxy"
 	"github.com/bonjoski/shield/pkg/shield"
@@ -46,6 +47,8 @@ func main() {
 	switch cmd {
 	case "proxy":
 		runProxy(os.Args[2:])
+	case "db":
+		runDB(os.Args[2:])
 	case "redact":
 		runRedact(os.Args[2:])
 	case "version":
@@ -73,6 +76,10 @@ Commands:
              --spiffe-acl <ids>         Comma-separated list of allowed SPIFFE IDs or wildcard patterns
              --provider <name>          AI Provider (gemini, claude, openai, ollama, mock)
              --model <model>            Model override
+  db       Manage the database capability wire guard (PostgreSQL AST policy & entropy filter)
+           Subcommands:
+             proxy                      Run transparent PostgreSQL wire proxy on UDS or TCP
+             inspect                    Inspect an SQL query against security policy offline
   redact   Scrub and tokenize secrets from a text stream or file
   version  Print shield version`)
 }
@@ -194,4 +201,145 @@ func runRedact(args []string) {
 
 	fmt.Println(redacted)
 	fmt.Fprintf(os.Stderr, "[SHIELD] Redacted %d unique secret(s).\n", tm.Count())
+}
+
+func runDB(args []string) {
+	if len(args) == 0 {
+		printDBUsage()
+		os.Exit(1)
+	}
+
+	subcmd := args[0]
+	switch subcmd {
+	case "proxy":
+		runDBProxy(args[1:])
+	case "inspect":
+		runDBInspect(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown db subcommand: %s\n", subcmd)
+		printDBUsage()
+		os.Exit(1)
+	}
+}
+
+func printDBUsage() {
+	fmt.Println(`Usage: shield db <subcommand> [flags]
+
+Subcommands:
+  proxy     Start transparent PostgreSQL wire guard proxy (Unix Domain Socket or TCP)
+            Flags:
+              --listen <addr|path>      Listen address or Unix domain socket (default: /tmp/shield-db.sock)
+              --upstream <addr>         Upstream PostgreSQL address (default: 127.0.0.1:5432)
+              --row-limit <int>         Maximum row limit to enforce on open SELECTs (default: 100)
+              --entropy-threshold <f>   Shannon entropy threshold in bits/byte (default: 5.0)
+              --require-token           Require Conjoiner task token for database connections
+  inspect   Evaluate SQL query against AST policy offline
+            Flags:
+              --row-limit <int>         Maximum row limit to test (default: 100)
+              <sql>                     SQL query string (or read from stdin if omitted)`)
+}
+
+func runDBProxy(args []string) {
+	fs := flag.NewFlagSet("shield db proxy", flag.ExitOnError)
+	listenAddr := fs.String("listen", "/tmp/shield-db.sock", "Listen address (Unix domain socket path or TCP host:port)")
+	upstreamAddr := fs.String("upstream", "127.0.0.1:5432", "Upstream PostgreSQL address (host:port or socket path)")
+	rowLimit := fs.Int("row-limit", 100, "Maximum row limit to enforce on open SELECTs")
+	entropyThreshold := fs.Float64("entropy-threshold", 5.0, "Shannon entropy threshold (bits/byte) for result row inspection")
+	requireToken := fs.Bool("require-token", false, "Require Conjoiner task token on connections")
+	_ = fs.Parse(args)
+
+	pol := dbguard.Policy{
+		BlockDDL:                    true,
+		BlockUnconstrainedMutations: true,
+		BlockPrivilegeEscalation:    true,
+		EnforceRowLimit:             int64(*rowLimit),
+		RequireConjoinerToken:       *requireToken,
+		EntropyLimit:                *entropyThreshold,
+	}
+
+	filter := dbguard.NewEngine(pol, dbguard.NewDefaultTokenVerifier(true))
+	scanner := dbguard.NewScanner(*entropyThreshold)
+
+	srv, err := dbguard.NewServer(dbguard.Config{
+		ListenAddr:     *listenAddr,
+		UpstreamAddr:   *upstreamAddr,
+		Filter:         filter,
+		EntropyScanner: scanner,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[SHIELD-DB] Configuration error: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := srv.Start(ctx); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "[SHIELD-DB] Failed to start database wire proxy: %v\n", err)
+			os.Exit(1)
+		}
+	}()
+
+	fmt.Printf("[SHIELD-DB] Database wire guard proxy active on %s (upstream: %s)\n", *listenAddr, *upstreamAddr)
+	fmt.Printf("[SHIELD-DB] Policy: DDL=BLOCKED, UnconstrainedMutations=BLOCKED, RowLimit=%d, EntropyThreshold=%.1f\n", *rowLimit, *entropyThreshold)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\n[SHIELD-DB] Shutting down database wire guard...")
+	cancel()
+	_ = srv.Close()
+}
+
+func runDBInspect(args []string) {
+	fs := flag.NewFlagSet("shield db inspect", flag.ExitOnError)
+	rowLimit := fs.Int("row-limit", 100, "Row limit to enforce on open SELECTs")
+	_ = fs.Parse(args)
+
+	var sql string
+	remaining := fs.Args()
+	if len(remaining) > 0 {
+		sql = strings.Join(remaining, " ")
+	} else {
+		inputBytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+		sql = string(inputBytes)
+	}
+
+	if strings.TrimSpace(sql) == "" {
+		fmt.Fprintln(os.Stderr, "Error: No SQL query provided")
+		os.Exit(1)
+	}
+
+	pol := dbguard.Policy{
+		BlockDDL:                    true,
+		BlockUnconstrainedMutations: true,
+		BlockPrivilegeEscalation:    true,
+		EnforceRowLimit:             int64(*rowLimit),
+		RequireConjoinerToken:       false,
+		EntropyLimit:                5.0,
+	}
+
+	filter := dbguard.NewEngine(pol, dbguard.NewDefaultTokenVerifier(true))
+	verdict, err := filter.InspectQuery(context.Background(), "", sql)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Inspection failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Action: %s\n", verdict.Action)
+	if verdict.Reason != "" {
+		fmt.Printf("Reason: %s\n", verdict.Reason)
+	}
+	if verdict.RewrittenSQL != "" && verdict.RewrittenSQL != sql {
+		fmt.Printf("Rewritten SQL:\n%s\n", verdict.RewrittenSQL)
+	}
+	if verdict.Action == dbguard.ActionBlock {
+		os.Exit(2)
+	}
 }
