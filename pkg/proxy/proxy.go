@@ -98,6 +98,15 @@ func DefaultSocketPath() string {
 	return filepath.Join(home, ".shield", "shield.sock")
 }
 
+// DefaultPIDPath returns the standard Shield PID file path.
+func DefaultPIDPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".shield", "shield.pid")
+}
+
 // NewServer initializes a proxy server using default TCP options.
 func NewServer(addr string, engine *shield.Engine, prov provider.Provider) *Server {
 	if addr == "" {

@@ -7,13 +7,16 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bonjoski/shield/pkg/dbguard"
 	"github.com/bonjoski/shield/pkg/provider"
 	"github.com/bonjoski/shield/pkg/proxy"
 	"github.com/bonjoski/shield/pkg/shield"
+	"github.com/bonjoski/shield/pkg/status"
 	"github.com/bonjoski/shield/pkg/version"
 )
 
@@ -47,6 +50,8 @@ func main() {
 	switch cmd {
 	case "proxy":
 		runProxy(os.Args[2:])
+	case "status":
+		runStatus(os.Args[2:])
 	case "db":
 		runDB(os.Args[2:])
 	case "redact":
@@ -68,6 +73,7 @@ Commands:
            Flags:
              --addr <addr>              TCP address to bind (default: 127.0.0.1:8080)
              --socket <path>            Unix domain socket path (e.g. ~/.shield/shield.sock)
+             --pid-file <path>          Path to write PID file (default: ~/.shield/shield.pid)
              --tls                      Enable trusted HTTPS listener
              --cert <path>              Server TLS certificate (default: ~/.locksmith/certs/server.crt)
              --key <path>               Server TLS private key (default: ~/.locksmith/certs/server.key)
@@ -76,6 +82,13 @@ Commands:
              --spiffe-acl <ids>         Comma-separated list of allowed SPIFFE IDs or wildcard patterns
              --provider <name>          AI Provider (gemini, claude, openai, ollama, mock)
              --model <model>            Model override
+  status   Check running status and health of the Shield proxy daemon
+           Flags:
+             --addr <addr>              TCP address to check (default: 127.0.0.1:8443, 127.0.0.1:8080)
+             --socket <path>            Unix domain socket path to check (default: ~/.shield/shield.sock)
+             --pid-file <path>          Path to PID file (default: ~/.shield/shield.pid)
+             --json                     Output status report as JSON
+             --timeout <duration>       Health probe timeout (default: 1s)
   db       Manage the database capability wire guard (PostgreSQL AST policy & entropy filter)
            Subcommands:
              proxy                      Run transparent PostgreSQL wire proxy on UDS or TCP
@@ -88,6 +101,7 @@ func runProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8080", "TCP address to bind proxy server (when not using --socket)")
 	socket := fs.String("socket", "", "Unix domain socket path to bind (e.g. ~/.shield/shield.sock)")
+	pidFile := fs.String("pid-file", proxy.DefaultPIDPath(), "Path to write PID file")
 	tlsEnabled := fs.Bool("tls", false, "Enable HTTPS / TLS listener")
 	cert := fs.String("cert", "", "Path to TLS server certificate PEM (defaults to ~/.locksmith/certs/server.crt if exists)")
 	key := fs.String("key", "", "Path to TLS server private key PEM (defaults to ~/.locksmith/certs/server.key if exists)")
@@ -165,12 +179,63 @@ func runProxy(args []string) {
 		os.Exit(1)
 	}
 
+	if *pidFile != "" {
+		expandedPID := proxy.ExpandPath(*pidFile)
+		if dir := filepath.Dir(expandedPID); dir != "" {
+			_ = os.MkdirAll(dir, 0700)
+		}
+		_ = os.WriteFile(expandedPID, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600)
+		defer func() {
+			_ = os.Remove(expandedPID)
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
 	fmt.Println("\n[SHIELD] Shutting down proxy...")
 	_ = srv.Stop(context.Background())
+}
+
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	addr := fs.String("addr", "", "TCP address to check (default: 127.0.0.1:8443, 127.0.0.1:8080)")
+	socket := fs.String("socket", "", "Unix domain socket path to check (default: ~/.shield/shield.sock)")
+	pidFile := fs.String("pid-file", "", "Path to PID file (default: ~/.shield/shield.pid)")
+	jsonOutput := fs.Bool("json", false, "Output status report as JSON")
+	timeoutStr := fs.String("timeout", "1s", "Health probe timeout")
+	_ = fs.Parse(args)
+
+	timeout, err := time.ParseDuration(*timeoutStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid timeout duration %q: %v\n", *timeoutStr, err)
+		os.Exit(1)
+	}
+
+	opts := status.Options{
+		Addr:       *addr,
+		SocketPath: *socket,
+		PIDFile:    *pidFile,
+		Timeout:    timeout,
+	}
+
+	info, err := status.Probe(context.Background(), opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Status check error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOutput {
+		jsonStr, err := info.FormatJSON()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "JSON formatting error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(jsonStr)
+	} else {
+		fmt.Print(info.FormatHuman())
+	}
 }
 
 func runRedact(args []string) {
