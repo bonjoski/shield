@@ -56,8 +56,12 @@ func main() {
 		runDB(os.Args[2:])
 	case "redact":
 		runRedact(os.Args[2:])
-	case "version":
+	case "version", "--version", "-v":
 		fmt.Printf("shield %s (bonjoski sovereign BYO-AI shield)\n", version.Version)
+		os.Exit(0)
+	case "help", "--help", "-h":
+		printUsage()
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
