@@ -3,6 +3,7 @@ package dbguard
 import (
 	"math"
 
+	"github.com/bonjoski/shield/pkg/shield"
 	"github.com/jackc/pgproto3/v2"
 )
 
@@ -12,6 +13,8 @@ const DefaultThreshold = 5.0
 
 // DefaultMinLength is the minimum byte length to evaluate entropy to avoid false positives on short strings.
 const DefaultMinLength = 16
+
+var rowSecretEngine = shield.NewEngine(shield.DefaultConfig())
 
 // CalculateShannonEntropy calculates Shannon entropy in bits per byte (0.0 to 8.0) for a byte slice.
 func CalculateShannonEntropy(data []byte) float64 {
@@ -36,7 +39,7 @@ func CalculateShannonEntropy(data []byte) float64 {
 	return entropy
 }
 
-// Scanner evaluates result sets and data rows for high Shannon 
+// Scanner evaluates result sets and data rows for high Shannon entropy or structured secret patterns.
 type Scanner struct {
 	Threshold float64
 	MinLength int
@@ -62,8 +65,8 @@ func (s *Scanner) Scan(data []byte) (float64, bool) {
 	return ent, ent >= s.Threshold
 }
 
-// ScanRow inspects all column values in a DataRow for high-entropy contents.
-// Returns the maximum entropy found across columns and whether any column exceeded the threshold.
+// ScanRow inspects all column values in a DataRow for high-entropy contents or structured secrets.
+// Returns the maximum entropy found across columns and whether any column violated policy.
 func (s *Scanner) ScanRow(row *pgproto3.DataRow) (float64, bool) {
 	if row == nil {
 		return 0.0, false
@@ -73,7 +76,13 @@ func (s *Scanner) ScanRow(row *pgproto3.DataRow) (float64, bool) {
 	var exceeded bool
 
 	for _, colVal := range row.Values {
-		if colVal == nil || len(colVal) < s.MinLength {
+		if len(colVal) == 0 {
+			continue
+		}
+		if err := rowSecretEngine.FailClosedWireGuard(colVal); err != nil {
+			exceeded = true
+		}
+		if len(colVal) < s.MinLength {
 			continue
 		}
 		ent := CalculateShannonEntropy(colVal)

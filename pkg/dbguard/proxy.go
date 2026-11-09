@@ -8,17 +8,19 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/jackc/pgproto3/v2"
-
-	
-	
 )
 
-// Config defines the configuration for the Crucible wire 
+// ErrSocketSymlink is returned when the configured Unix domain socket path is a symlink.
+var ErrSocketSymlink = errors.New("security violation: database proxy socket path is a symlink")
+
+// Config defines the configuration for the Crucible wire guard proxy.
 type Config struct {
 	ListenAddr     string
 	UpstreamAddr   string
@@ -66,6 +68,26 @@ func isUnixSocket(addr string) bool {
 	return strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, "./") || strings.HasSuffix(addr, ".sock")
 }
 
+func safeRemoveUnixSocket(sockPath string) error {
+	fi, err := os.Lstat(sockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return ErrSocketSymlink
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("security violation: refusing to remove non-socket file %s", sockPath)
+	}
+	if err := os.Remove(sockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Start begins listening for client connections and proxying to upstream PostgreSQL.
 func (s *Server) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -74,14 +96,38 @@ func (s *Server) Start(ctx context.Context) error {
 	network := "tcp"
 	if s.isUnix {
 		network = "unix"
-		// Clean up stale socket file if it exists
-		_ = os.Remove(s.cfg.ListenAddr)
+		if err := safeRemoveUnixSocket(s.cfg.ListenAddr); err != nil {
+			return err
+		}
+		if dir := filepath.Dir(s.cfg.ListenAddr); dir != "" && dir != "." {
+			if _, statErr := os.Stat(dir); errors.Is(statErr, os.ErrNotExist) {
+				if mkErr := os.MkdirAll(dir, 0700); mkErr != nil {
+					return fmt.Errorf("failed to create socket directory %s: %w", dir, mkErr)
+				}
+			}
+		}
 	}
 
 	ln, err := net.Listen(network, s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s (%s): %w", network, s.cfg.ListenAddr, err)
 	}
+
+	if s.isUnix {
+		if fi, lerr := os.Lstat(s.cfg.ListenAddr); lerr != nil {
+			_ = ln.Close()
+			return fmt.Errorf("failed to lstat unix socket %s: %w", s.cfg.ListenAddr, lerr)
+		} else if fi.Mode()&os.ModeSymlink != 0 {
+			_ = ln.Close()
+			return ErrSocketSymlink
+		}
+		if chmodErr := os.Chmod(s.cfg.ListenAddr, 0600); chmodErr != nil {
+			_ = ln.Close()
+			_ = safeRemoveUnixSocket(s.cfg.ListenAddr)
+			return fmt.Errorf("failed to enforce 0600 permissions on unix socket %s: %w", s.cfg.ListenAddr, chmodErr)
+		}
+	}
+
 	s.listener = ln
 	s.cfg.Logger.Printf("Crucible proxy listening on %s (%s), upstream %s", s.cfg.ListenAddr, network, s.cfg.UpstreamAddr)
 
@@ -120,7 +166,9 @@ func (s *Server) Close() error {
 		err = s.listener.Close()
 	}
 	if s.isUnix {
-		_ = os.Remove(s.cfg.ListenAddr)
+		if rmErr := safeRemoveUnixSocket(s.cfg.ListenAddr); rmErr != nil && err == nil {
+			err = rmErr
+		}
 	}
 	return err
 }
@@ -149,7 +197,6 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	// 2. Handle SSLRequest or GSSEncRequest: decline TLS over local socket
 	for {
 		if _, ok := startupMsg.(*pgproto3.SSLRequest); ok {
-			// Write single 'N' byte to indicate SSL not supported on this local wire shim
 			if _, err := clientConn.Write([]byte{'N'}); err != nil {
 				return
 			}
@@ -197,8 +244,8 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 		s.cfg.Logger.Printf("failed to connect to upstream %s: %v", s.cfg.UpstreamAddr, err)
 		_ = clientBackend.Send(&pgproto3.ErrorResponse{
 			Severity: "FATAL",
-			Code:     "08006", // connection_failure
-			Message:  fmt.Sprintf("Crucible: failed to connect to upstream PostgreSQL: %v", err),
+			Code:     "08006",
+			Message:  "Crucible: failed to connect to upstream PostgreSQL",
 		})
 		return
 	}
@@ -260,7 +307,6 @@ func (s *Server) handshake(client *pgproto3.Backend, upstream *pgproto3.Frontend
 			*pgproto3.AuthenticationSASL,
 			*pgproto3.AuthenticationSASLContinue,
 			*pgproto3.AuthenticationSASLFinal:
-			// Read client auth response and forward to upstream
 			clientMsg, err := client.Receive()
 			if err != nil {
 				return fmt.Errorf("client auth receive error: %w", err)
@@ -270,7 +316,6 @@ func (s *Server) handshake(client *pgproto3.Backend, upstream *pgproto3.Frontend
 			}
 
 		case *pgproto3.ReadyForQuery:
-			// Handshake complete, connection is ready for queries
 			return nil
 
 		case *pgproto3.ErrorResponse:
@@ -279,8 +324,13 @@ func (s *Server) handshake(client *pgproto3.Backend, upstream *pgproto3.Frontend
 	}
 }
 
-// relayClientToUpstream intercepts client queries and validates them against security 
+// relayClientToUpstream intercepts client queries and validates them against security policy.
+// When an Extended Query protocol Parse message is blocked, subsequent pipelined Bind/Describe/Execute
+// frames are drained up to Sync ('S') per the PostgreSQL v3 wire specification so framing stays synchronized
+// and previously prepared statements on upstream can never be executed by pipelined frames.
 func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string, client *pgproto3.Backend, upstream *pgproto3.Frontend) {
+	discardUntilSync := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -293,14 +343,27 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 			return
 		}
 
+		if discardUntilSync {
+			switch m := msg.(type) {
+			case *pgproto3.Sync:
+				discardUntilSync = false
+				_ = client.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			case *pgproto3.Terminate:
+				_ = upstream.Send(m)
+				return
+			default:
+				// Discard pipelined Bind, Describe, Execute, Flush, Close, etc. until Sync
+			}
+			continue
+		}
+
 		switch m := msg.(type) {
 		case *pgproto3.Query:
-			// Simple query protocol
 			verdict, err := s.cfg.Filter.InspectQuery(ctx, sessionToken, m.String)
 			if err != nil {
 				_ = client.Send(&pgproto3.ErrorResponse{
 					Severity: "ERROR",
-					Code:     "42501", // insufficient_privilege
+					Code:     "42501",
 					Message:  fmt.Sprintf("Crucible policy engine error: %v", err),
 				})
 				_ = client.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
@@ -330,7 +393,6 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 			}
 
 		case *pgproto3.Parse:
-			// Extended query protocol
 			verdict, err := s.cfg.Filter.InspectQuery(ctx, sessionToken, m.Query)
 			if err != nil {
 				_ = client.Send(&pgproto3.ErrorResponse{
@@ -338,6 +400,7 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 					Code:     "42501",
 					Message:  fmt.Sprintf("Crucible policy engine error: %v", err),
 				})
+				discardUntilSync = true
 				continue
 			}
 
@@ -348,6 +411,7 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 					Code:     "42501",
 					Message:  fmt.Sprintf("Crucible policy violation: %s", verdict.Reason),
 				})
+				discardUntilSync = true
 				continue
 
 			case ActionRewrite:
@@ -367,7 +431,6 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 			return
 
 		default:
-			// Bind, Execute, Describe, Sync, Flush, Close, etc.
 			if err := upstream.Send(m); err != nil {
 				return
 			}
@@ -375,8 +438,24 @@ func (s *Server) relayClientToUpstream(ctx context.Context, sessionToken string,
 	}
 }
 
-// relayUpstreamToClient forwards backend messages to client and scans data rows for 
+func zeroizeRowValues(row *pgproto3.DataRow) {
+	if row == nil {
+		return
+	}
+	for _, col := range row.Values {
+		for i := range col {
+			col[i] = 0
+		}
+		runtime.KeepAlive(col)
+	}
+}
+
+// relayUpstreamToClient forwards backend messages to client and fails closed on high-entropy
+// or secret-bearing DataRow payloads, suppressing leaked rows and emitting an ErrorResponse
+// while keeping wire framing synchronized up to ReadyForQuery.
 func (s *Server) relayUpstreamToClient(ctx context.Context, upstream *pgproto3.Frontend, client *pgproto3.Backend) {
+	suppressResultUntilReady := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -389,10 +468,36 @@ func (s *Server) relayUpstreamToClient(ctx context.Context, upstream *pgproto3.F
 			return
 		}
 
+		if suppressResultUntilReady {
+			switch m := msg.(type) {
+			case *pgproto3.DataRow:
+				zeroizeRowValues(m)
+				continue
+			case *pgproto3.CommandComplete, *pgproto3.PortalSuspended, *pgproto3.EmptyQueryResponse:
+				continue
+			case *pgproto3.ReadyForQuery:
+				suppressResultUntilReady = false
+				if err := client.Send(m); err != nil {
+					return
+				}
+				continue
+			}
+		}
+
 		if row, ok := msg.(*pgproto3.DataRow); ok && s.cfg.EntropyScanner != nil {
 			maxEnt, exceeded := s.cfg.EntropyScanner.ScanRow(row)
 			if exceeded {
-				s.cfg.Logger.Printf("ALERT: High Shannon entropy (%.2f bits/byte) detected in result set row", maxEnt)
+				s.cfg.Logger.Printf("BLOCKED: High Shannon entropy (%.2f bits/byte) or secret detected in result set row", maxEnt)
+				zeroizeRowValues(row)
+				suppressResultUntilReady = true
+				if err := client.Send(&pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "42501",
+					Message:  fmt.Sprintf("Crucible policy violation: result row blocked due to high entropy (%.2f bits/byte) or credential leakage", maxEnt),
+				}); err != nil {
+					return
+				}
+				continue
 			}
 		}
 

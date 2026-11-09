@@ -5,17 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
 type GeminiProvider struct {
-	apiKey     string
-	model      string
-	httpClient *http.Client
-	baseURL    string
+	apiKey        string
+	model         string
+	httpClient    *http.Client
+	baseURL       string
+	allowLoopback bool
 }
 
 func NewGeminiProvider(apiKey string, model string) *GeminiProvider {
@@ -25,9 +25,18 @@ func NewGeminiProvider(apiKey string, model string) *GeminiProvider {
 	return &GeminiProvider{
 		apiKey:     apiKey,
 		model:      model,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: NewSafeHTTPClient(60*time.Second, false),
 		baseURL:    "https://generativelanguage.googleapis.com/v1beta",
 	}
+}
+
+// NewGeminiProviderForTest creates a GeminiProvider allowing explicit loopback test servers (e.g. httptest.NewServer).
+func NewGeminiProviderForTest(apiKey string, model string, baseURL string) *GeminiProvider {
+	p := NewGeminiProvider(apiKey, model)
+	p.baseURL = strings.TrimRight(baseURL, "/")
+	p.allowLoopback = true
+	p.httpClient = NewSafeHTTPClient(10*time.Second, true)
+	return p
 }
 
 func (g *GeminiProvider) Name() string {
@@ -60,7 +69,7 @@ type geminiCandidate struct {
 }
 
 type geminiResponse struct {
-	Candidates []geminiCandidate `json:"candidates"`
+	Candidates    []geminiCandidate `json:"candidates"`
 	UsageMetadata struct {
 		PromptTokenCount     int `json:"promptTokenCount"`
 		CandidatesTokenCount int `json:"candidatesTokenCount"`
@@ -79,6 +88,14 @@ func (g *GeminiProvider) Complete(ctx context.Context, req Request) (*Response, 
 	model := req.Model
 	if model == "" {
 		model = g.model
+	}
+	if err := ValidateModelName(model); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
+	}
+
+	cleanBase, err := ValidateBaseURL(g.baseURL, g.allowLoopback, !g.allowLoopback)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
 	}
 
 	gReq := geminiRequest{
@@ -107,27 +124,28 @@ func (g *GeminiProvider) Complete(ctx context.Context, req Request) (*Response, 
 		return nil, fmt.Errorf("gemini marshal error: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", g.baseURL, model, g.apiKey)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent", cleanBase, model)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("gemini request creation failed: %w", err)
+		return nil, fmt.Errorf("gemini request creation failed: %w", sanitizeTransportError(err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", g.apiKey)
 
 	httpResp, err := g.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrProviderFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, sanitizeTransportError(err))
 	}
 	defer httpResp.Body.Close()
 
-	respBytes, err := io.ReadAll(httpResp.Body)
+	respBytes, err := ReadBoundedBody(httpResp.Body, MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("gemini read response failed: %w", err)
 	}
 
 	var gResp geminiResponse
 	if err := json.Unmarshal(respBytes, &gResp); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 
 	if gResp.Error != nil {

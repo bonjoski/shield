@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +20,8 @@ import (
 	"github.com/bonjoski/shield/pkg/status"
 	"github.com/bonjoski/shield/pkg/version"
 )
+
+const maxCLIInputBytes int64 = 64 << 20 // 64 MiB CLI input bound
 
 type stringSliceFlag []string
 
@@ -101,6 +104,32 @@ Commands:
   version  Print shield version`)
 }
 
+func writePIDFileSafely(pidPath string) error {
+	if pidPath == "" {
+		return nil
+	}
+	if fi, err := os.Lstat(pidPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to write PID to symlink")
+	}
+	if dir := filepath.Dir(pidPath); dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600)
+}
+
+func removePIDFileSafely(pidPath string) {
+	if pidPath == "" {
+		return
+	}
+	if fi, err := os.Lstat(pidPath); err == nil && fi.Mode()&os.ModeSymlink == 0 {
+		if rmErr := os.Remove(pidPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "[SHIELD] Warning: failed to remove PID file %s: %v\n", pidPath, rmErr)
+		}
+	}
+}
+
 func runProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8080", "TCP address to bind proxy server (when not using --socket)")
@@ -115,7 +144,9 @@ func runProxy(args []string) {
 	fs.Var(&allowedSPIFFEIDs, "spiffe-acl", "Comma-separated list of allowed SPIFFE IDs or wildcard patterns")
 	providerName := fs.String("provider", "mock", "AI Provider to route to (gemini, claude, openai, ollama, mock)")
 	model := fs.String("model", "", "Model name override")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
 
 	var prov provider.Provider
 	switch *providerName {
@@ -185,13 +216,11 @@ func runProxy(args []string) {
 
 	if *pidFile != "" {
 		expandedPID := proxy.ExpandPath(*pidFile)
-		if dir := filepath.Dir(expandedPID); dir != "" {
-			_ = os.MkdirAll(dir, 0700)
+		if err := writePIDFileSafely(expandedPID); err != nil {
+			fmt.Fprintf(os.Stderr, "[SHIELD] Warning: failed to write PID file %s: %v\n", expandedPID, err)
+		} else {
+			defer removePIDFileSafely(expandedPID)
 		}
-		_ = os.WriteFile(expandedPID, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600)
-		defer func() {
-			_ = os.Remove(expandedPID)
-		}()
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -199,7 +228,9 @@ func runProxy(args []string) {
 	<-sigCh
 
 	fmt.Println("\n[SHIELD] Shutting down proxy...")
-	_ = srv.Stop(context.Background())
+	if err := srv.Stop(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "[SHIELD] Warning: shutdown error: %v\n", err)
+	}
 }
 
 func runStatus(args []string) {
@@ -209,7 +240,9 @@ func runStatus(args []string) {
 	pidFile := fs.String("pid-file", "", "Path to PID file (default: ~/.shield/shield.pid)")
 	jsonOutput := fs.Bool("json", false, "Output status report as JSON")
 	timeoutStr := fs.String("timeout", "1s", "Health probe timeout")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
 
 	timeout, err := time.ParseDuration(*timeoutStr)
 	if err != nil {
@@ -245,15 +278,23 @@ func runStatus(args []string) {
 func runRedact(args []string) {
 	fs := flag.NewFlagSet("redact", flag.ExitOnError)
 	inputFile := fs.String("input", "-", "Input file or '-' for stdin")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
 
 	var inputBytes []byte
 	var err error
 
 	if *inputFile == "-" {
-		inputBytes, err = io.ReadAll(os.Stdin)
+		inputBytes, err = io.ReadAll(io.LimitReader(os.Stdin, maxCLIInputBytes))
 	} else {
-		inputBytes, err = os.ReadFile(*inputFile)
+		f, openErr := os.Open(*inputFile)
+		if openErr != nil {
+			fmt.Fprintf(os.Stderr, "Error opening input: %v\n", openErr)
+			os.Exit(1)
+		}
+		inputBytes, err = io.ReadAll(io.LimitReader(f, maxCLIInputBytes))
+		_ = f.Close()
 	}
 
 	if err != nil {
@@ -267,6 +308,7 @@ func runRedact(args []string) {
 		fmt.Fprintf(os.Stderr, "Redaction error: %v\n", err)
 		os.Exit(1)
 	}
+	defer tm.Zeroize()
 
 	fmt.Println(redacted)
 	fmt.Fprintf(os.Stderr, "[SHIELD] Redacted %d unique secret(s).\n", tm.Count())
@@ -284,6 +326,9 @@ func runDB(args []string) {
 		runDBProxy(args[1:])
 	case "inspect":
 		runDBInspect(args[1:])
+	case "help", "--help", "-h":
+		printDBUsage()
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown db subcommand: %s\n", subcmd)
 		printDBUsage()
@@ -297,15 +342,32 @@ func printDBUsage() {
 Subcommands:
   proxy     Start transparent PostgreSQL wire guard proxy (Unix Domain Socket or TCP)
             Flags:
-              --listen <addr|path>      Listen address or Unix domain socket (default: /tmp/shield-db.sock)
-              --upstream <addr>         Upstream PostgreSQL address (default: 127.0.0.1:5432)
-              --row-limit <int>         Maximum row limit to enforce on open SELECTs (default: 100)
-              --entropy-threshold <f>   Shannon entropy threshold in bits/byte (default: 5.0)
-              --require-token           Require Conjoiner task token for database connections
+              --listen <addr|path>                     Listen address or Unix domain socket (default: /tmp/shield-db.sock)
+              --upstream <addr>                        Upstream PostgreSQL address (default: 127.0.0.1:5432)
+              --row-limit <int>                        Maximum row limit to enforce on open SELECTs (default: 100)
+              --entropy-threshold <f>                  Shannon entropy threshold in bits/byte (default: 5.0)
+              --require-token                          Require Conjoiner task token for database connections (default: true)
+              --token-secret <secret>                  HMAC secret for verifying Conjoiner DB tokens (or SHIELD_DB_TOKEN_SECRET)
+              --allowed-token <tok>                    Explicit allowlisted Conjoiner task token (repeatable or comma-separated)
+              --insecure-allow-unverified-db-tokens    Explicitly permit unverified/absent DB tokens (development only)
   inspect   Evaluate SQL query against AST policy offline
             Flags:
-              --row-limit <int>         Maximum row limit to test (default: 100)
-              <sql>                     SQL query string (or read from stdin if omitted)`)
+              --row-limit <int>                        Maximum row limit to test (default: 100)
+              <sql>                                    SQL query string (or read from stdin if omitted)`)
+}
+
+func buildDBTokenVerifier(requireToken bool, tokenSecret string, allowedTokens []string, insecureAllowUnverified bool) (dbguard.TokenVerifier, error) {
+	if insecureAllowUnverified {
+		return dbguard.NewDefaultTokenVerifier(true, allowedTokens...), nil
+	}
+	if !requireToken {
+		return nil, errors.New("disabling --require-token requires --insecure-allow-unverified-db-tokens")
+	}
+	verifier, err := dbguard.NewHMACTokenVerifier(tokenSecret, allowedTokens...)
+	if err != nil {
+		return nil, errors.New("--token-secret (or SHIELD_DB_TOKEN_SECRET / --allowed-token) is required unless --insecure-allow-unverified-db-tokens is explicitly set")
+	}
+	return verifier, nil
 }
 
 func runDBProxy(args []string) {
@@ -314,8 +376,28 @@ func runDBProxy(args []string) {
 	upstreamAddr := fs.String("upstream", "127.0.0.1:5432", "Upstream PostgreSQL address (host:port or socket path)")
 	rowLimit := fs.Int("row-limit", 100, "Maximum row limit to enforce on open SELECTs")
 	entropyThreshold := fs.Float64("entropy-threshold", 5.0, "Shannon entropy threshold (bits/byte) for result row inspection")
-	requireToken := fs.Bool("require-token", false, "Require Conjoiner task token on connections")
-	_ = fs.Parse(args)
+	requireToken := fs.Bool("require-token", true, "Require verified Conjoiner task token on connections")
+	tokenSecret := fs.String("token-secret", os.Getenv("SHIELD_DB_TOKEN_SECRET"), "HMAC secret for Conjoiner DB token verification")
+	var allowedTokens stringSliceFlag
+	fs.Var(&allowedTokens, "allowed-token", "Explicit allowlisted Conjoiner task token (repeatable or comma-separated)")
+	insecureAllowUnverified := fs.Bool("insecure-allow-unverified-db-tokens", false, "Explicitly permit unverified/absent DB tokens (dev only)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if envAllowed := strings.TrimSpace(os.Getenv("SHIELD_DB_ALLOWED_TOKENS")); envAllowed != "" {
+		_ = allowedTokens.Set(envAllowed)
+	}
+
+	verifier, err := buildDBTokenVerifier(*requireToken, *tokenSecret, allowedTokens, *insecureAllowUnverified)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[SHIELD-DB] Security configuration error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *insecureAllowUnverified {
+		fmt.Fprintln(os.Stderr, "[SHIELD-DB] [WARNING] --insecure-allow-unverified-db-tokens enabled; task token verification is degraded.")
+	}
 
 	pol := dbguard.Policy{
 		BlockDDL:                    true,
@@ -326,7 +408,7 @@ func runDBProxy(args []string) {
 		EntropyLimit:                *entropyThreshold,
 	}
 
-	filter := dbguard.NewEngine(pol, dbguard.NewDefaultTokenVerifier(true))
+	filter := dbguard.NewEngine(pol, verifier)
 	scanner := dbguard.NewScanner(*entropyThreshold)
 
 	srv, err := dbguard.NewServer(dbguard.Config{
@@ -359,22 +441,26 @@ func runDBProxy(args []string) {
 
 	fmt.Println("\n[SHIELD-DB] Shutting down database wire guard...")
 	cancel()
-	_ = srv.Close()
+	if err := srv.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "[SHIELD-DB] Warning: error closing server: %v\n", err)
+	}
 }
 
 func runDBInspect(args []string) {
 	fs := flag.NewFlagSet("shield db inspect", flag.ExitOnError)
 	rowLimit := fs.Int("row-limit", 100, "Row limit to enforce on open SELECTs")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
 
 	var sql string
 	remaining := fs.Args()
 	if len(remaining) > 0 {
 		sql = strings.Join(remaining, " ")
 	} else {
-		inputBytes, err := io.ReadAll(os.Stdin)
+		inputBytes, err := io.ReadAll(io.LimitReader(os.Stdin, maxCLIInputBytes))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v", err)
 			os.Exit(1)
 		}
 		sql = string(inputBytes)
@@ -394,7 +480,7 @@ func runDBInspect(args []string) {
 		EntropyLimit:                5.0,
 	}
 
-	filter := dbguard.NewEngine(pol, dbguard.NewDefaultTokenVerifier(true))
+	filter := dbguard.NewEngine(pol, dbguard.NewDefaultTokenVerifier(false))
 	verdict, err := filter.InspectQuery(context.Background(), "", sql)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Inspection failed: %v\n", err)

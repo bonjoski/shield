@@ -1,7 +1,10 @@
 package shield
 
 import (
+	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"runtime"
@@ -9,35 +12,56 @@ import (
 )
 
 // TokenMap holds the bi-directional mapping between scrubbed placeholder references
-// (e.g. "[SECRET_REF_e7a9b1c2]") and the original raw secret values.
-// All values are stored strictly in-memory and can be explicitly zeroized.
+// (e.g. "[SECRET_REF_e7a9b1c2d3e4f501]") and the original raw secret values.
+// Raw secrets are stored exclusively in mutable []byte buffers (with HMAC-indexed
+// deduplication keys) so Zeroize() overwrites secret bytes in place on the heap.
 type TokenMap struct {
-	mu            sync.RWMutex
-	refToSecret   map[string]string
-	secretToRef   map[string]string
-	namedSecrets  map[string]string // Maps semantic variable name (e.g. "DATABASE_URL") to ref
+	mu           sync.RWMutex
+	hmacKey      [32]byte
+	refToSecret  map[string][]byte
+	digestToRef  map[[32]byte]string
+	namedSecrets map[string]string // Maps semantic variable name (e.g. "DATABASE_URL") to ref
 }
 
 // NewTokenMap initializes an empty thread-safe TokenMap.
 func NewTokenMap() *TokenMap {
-	return &TokenMap{
-		refToSecret:  make(map[string]string),
-		secretToRef:  make(map[string]string),
+	tm := &TokenMap{
+		refToSecret:  make(map[string][]byte),
+		digestToRef:  make(map[[32]byte]string),
 		namedSecrets: make(map[string]string),
 	}
+	_, _ = rand.Read(tm.hmacKey[:])
+	return tm
+}
+
+func (tm *TokenMap) computeDigest(secret []byte) [32]byte {
+	mac := hmac.New(sha256.New, tm.hmacKey[:])
+	_, _ = mac.Write(secret)
+	var out [32]byte
+	copy(out[:], mac.Sum(nil))
+	return out
 }
 
 // Add inserts a raw secret, returning its consistent placeholder reference.
 // If the secret already exists in the map, its existing reference is returned.
 func (tm *TokenMap) Add(secret string, optionalName string) string {
+	return tm.AddBytes([]byte(secret), optionalName)
+}
+
+// AddBytes inserts raw secret bytes into an owned mutable buffer inside TokenMap,
+// returning its consistent placeholder reference across the lifetime of the TokenMap.
+func (tm *TokenMap) AddBytes(secret []byte, optionalName string) string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if ref, exists := tm.secretToRef[secret]; exists {
-		if optionalName != "" {
-			tm.namedSecrets[optionalName] = ref
+	digest := tm.computeDigest(secret)
+	if ref, exists := tm.digestToRef[digest]; exists {
+		if existing, ok := tm.refToSecret[ref]; ok && bytes.Equal(existing, secret) {
+			if optionalName != "" {
+				tm.namedSecrets[optionalName] = ref
+			}
+			return ref
 		}
-		return ref
 	}
 
 	// Generate a fixed-length 8-byte (16 hex chars) random identifier
@@ -45,8 +69,11 @@ func (tm *TokenMap) Add(secret string, optionalName string) string {
 	_, _ = rand.Read(b)
 	ref := fmt.Sprintf("[SECRET_REF_%s]", hex.EncodeToString(b))
 
-	tm.refToSecret[ref] = secret
-	tm.secretToRef[secret] = ref
+	owned := make([]byte, len(secret))
+	copy(owned, secret)
+
+	tm.refToSecret[ref] = owned
+	tm.digestToRef[digest] = ref
 	if optionalName != "" {
 		tm.namedSecrets[optionalName] = ref
 	}
@@ -54,20 +81,43 @@ func (tm *TokenMap) Add(secret string, optionalName string) string {
 	return ref
 }
 
-// GetSecret resolves a placeholder reference back to the original secret.
+// GetSecret resolves a placeholder reference back to a string copy of the original secret.
 func (tm *TokenMap) GetSecret(ref string) (string, bool) {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	secret, ok := tm.refToSecret[ref]
-	return secret, ok
+	if !ok {
+		return "", false
+	}
+	return string(secret), true
+}
+
+// GetSecretBytes returns a caller-owned copy of the raw secret bytes for a placeholder reference.
+func (tm *TokenMap) GetSecretBytes(ref string) ([]byte, bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	secret, ok := tm.refToSecret[ref]
+	if !ok {
+		return nil, false
+	}
+	out := make([]byte, len(secret))
+	copy(out, secret)
+	return out, true
 }
 
 // GetRef returns the placeholder reference for a known secret value.
 func (tm *TokenMap) GetRef(secret string) (string, bool) {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-	ref, ok := tm.secretToRef[secret]
-	return ref, ok
+	digest := tm.computeDigest([]byte(secret))
+	ref, ok := tm.digestToRef[digest]
+	if !ok {
+		return "", false
+	}
+	if existing, exists := tm.refToSecret[ref]; !exists || !bytes.Equal(existing, []byte(secret)) {
+		return "", false
+	}
+	return ref, true
 }
 
 // Count returns the number of tracked secrets in the map.
@@ -88,23 +138,24 @@ func (tm *TokenMap) References() []string {
 	return refs
 }
 
-// Zeroize explicitly clears all secret strings in memory to prevent heap scraping.
+// Zeroize overwrites all mutable secret byte slices and HMAC key material in place
+// before purging map entries to prevent heap scraping.
 func (tm *TokenMap) Zeroize() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	for k, v := range tm.refToSecret {
-		b := []byte(v)
-		for i := range b {
-			b[i] = 0
+	for k, buf := range tm.refToSecret {
+		for i := range buf {
+			buf[i] = 0
 		}
+		runtime.KeepAlive(buf)
 		delete(tm.refToSecret, k)
 	}
-	for k := range tm.secretToRef {
-		delete(tm.secretToRef, k)
+	for i := range tm.hmacKey {
+		tm.hmacKey[i] = 0
 	}
-	for k := range tm.namedSecrets {
-		delete(tm.namedSecrets, k)
-	}
-	runtime.GC()
+	runtime.KeepAlive(&tm.hmacKey)
+
+	clear(tm.digestToRef)
+	clear(tm.namedSecrets)
 }

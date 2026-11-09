@@ -3,12 +3,17 @@ package shield
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 var (
 	// ErrSecretLeakageDetected is returned by FailClosedWireGuard if unredacted secrets escape.
 	ErrSecretLeakageDetected = errors.New("fail-closed wire guard: unredacted secret detected in outbound payload")
+
+	placeholderRegex = regexp.MustCompile(`\[SECRET_REF_[0-9a-fA-F]{16}\]`)
 )
 
 // Config configures the detection and redaction behavior of the Shield engine.
@@ -51,30 +56,132 @@ func NewEngine(cfg Config) *Engine {
 	return &Engine{cfg: cfg}
 }
 
-// normalizeInvisibleChars strips zero-width and invisible unicode characters
-// used by adversaries attempting to evade regex matching and entropy checks.
-func normalizeInvisibleChars(s string) string {
-	s = strings.ReplaceAll(s, "\u200b", "") // Zero-width space
-	s = strings.ReplaceAll(s, "\u200c", "") // Zero-width non-joiner
-	s = strings.ReplaceAll(s, "\u200d", "") // Zero-width joiner
-	s = strings.ReplaceAll(s, "\ufeff", "") // Zero-width no-break space (BOM)
-	return s
+// isInvisibleFormatRune returns true for Unicode Format (Cf), Variation Selectors,
+// Unicode Tags (U+E0000..U+E007F), soft hyphens, bidi overrides, and invisible fillers
+// used by adversaries to split secret tokens and evade regex/entropy inspection.
+func isInvisibleFormatRune(r rune) bool {
+	if unicode.Is(unicode.Cf, r) {
+		return true
+	}
+	// Variation Selectors (VS1..VS16 and VS17..VS256)
+	if (r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) {
+		return true
+	}
+	// Full Tags block (including unassigned/deprecated tag codepoints)
+	if r >= 0xE0000 && r <= 0xE007F {
+		return true
+	}
+	// Combining Grapheme Joiner & invisible Hangul/Khmer fillers
+	switch r {
+	case 0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0:
+		return true
+	}
+	return false
 }
 
-// Redact scans the input string, substitutes all discovered secrets with opaque
-// placeholders (e.g. "[SECRET_REF_e7a9b1c2]"), and stores mappings in a TokenMap.
-func (e *Engine) Redact(input string) (string, *TokenMap, error) {
-	tm := NewTokenMap()
-	output := normalizeInvisibleChars(input)
+// normalizeInvisibleChars strips zero-width, format (Cf), tag, and variation-selector
+// unicode characters used by adversaries attempting to evade regex matching and entropy checks.
+func normalizeInvisibleChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if isInvisibleFormatRune(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
 
-	// 1. First Pass: Synchronized Vault Credentials (exact matches)
+type vaultEntry struct {
+	name   string
+	secret string
+}
+
+func (e *Engine) sortedVaultEntries() []vaultEntry {
+	entries := make([]vaultEntry, 0, len(e.cfg.CustomVaultKeys))
 	for name, secret := range e.cfg.CustomVaultKeys {
 		if len(secret) < 4 {
 			continue
 		}
-		if strings.Contains(output, secret) {
-			ref := tm.Add(secret, name)
-			output = strings.ReplaceAll(output, secret, ref)
+		entries = append(entries, vaultEntry{name: name, secret: secret})
+	}
+	// Sort by descending secret length so longer secrets replace cleanly before shorter prefixes.
+	sort.Slice(entries, func(i, j int) bool {
+		if len(entries[i].secret) != len(entries[j].secret) {
+			return len(entries[i].secret) > len(entries[j].secret)
+		}
+		if entries[i].secret != entries[j].secret {
+			return entries[i].secret < entries[j].secret
+		}
+		return entries[i].name < entries[j].name
+	})
+	return entries
+}
+
+func isNonSecretAssignmentValue(val string) bool {
+	lower := strings.ToLower(strings.TrimSpace(val))
+	switch lower {
+	case "", "true", "false", "null", "none", "nil", "undefined", "redacted", "[redacted]":
+		return true
+	}
+	if strings.Contains(val, "[SECRET_REF_") {
+		return true
+	}
+	if strings.HasPrefix(val, "${") || strings.HasPrefix(val, "os.Getenv(") || strings.HasPrefix(val, "process.env.") {
+		return true
+	}
+	return false
+}
+
+func isTokenDelimiter(r rune) bool {
+	if unicode.IsSpace(r) {
+		return true
+	}
+	switch r {
+	case '"', '\'', '`', '=', ':', ';', ',', '&', '?', '/', '\\', '(', ')', '{', '}', '<', '>', '|':
+		return true
+	}
+	return false
+}
+
+func extractCandidateSegments(s string) []string {
+	// Temporarily replace valid placeholders with spaces so brackets inside [SECRET_REF_...] are ignored.
+	masked := placeholderRegex.ReplaceAllString(s, " ")
+	rawFields := strings.FieldsFunc(masked, isTokenDelimiter)
+	out := make([]string, 0, len(rawFields))
+	for _, f := range rawFields {
+		cleaned := strings.Trim(f, `"',;:()[]{}<>`)
+		if cleaned == "" || strings.Contains(cleaned, "[SECRET_REF_") {
+			continue
+		}
+		out = append(out, cleaned)
+	}
+	return out
+}
+
+// Redact scans the input string, substitutes all discovered secrets with opaque
+// placeholders (e.g. "[SECRET_REF_e7a9b1c2d3e4f501]"), and stores mappings in a new TokenMap.
+func (e *Engine) Redact(input string) (string, *TokenMap, error) {
+	tm := NewTokenMap()
+	out, err := e.RedactWithTokenMap(input, tm)
+	if err != nil {
+		tm.Zeroize()
+		return "", nil, err
+	}
+	return out, tm, nil
+}
+
+// RedactWithTokenMap scans input using a caller-supplied TokenMap so all fields/messages
+// within a single request share consistent placeholder tokens.
+func (e *Engine) RedactWithTokenMap(input string, tm *TokenMap) (string, error) {
+	if tm == nil {
+		return "", errors.New("shield: TokenMap must not be nil")
+	}
+	output := normalizeInvisibleChars(input)
+
+	// 1. First Pass: Synchronized Vault Credentials sorted by descending length
+	for _, entry := range e.sortedVaultEntries() {
+		if strings.Contains(output, entry.secret) {
+			ref := tm.Add(entry.secret, entry.name)
+			output = strings.ReplaceAll(output, entry.secret, ref)
 		}
 	}
 
@@ -91,8 +198,7 @@ func (e *Engine) Redact(input string) (string, *TokenMap, error) {
 				candidate = m[1]
 			}
 
-			// Don't redact placeholders that were already created or strings containing them
-			if strings.Contains(candidate, "[SECRET_REF_") {
+			if isNonSecretAssignmentValue(candidate) {
 				continue
 			}
 
@@ -106,21 +212,23 @@ func (e *Engine) Redact(input string) (string, *TokenMap, error) {
 		}
 	}
 
-	// 3. Third Pass: High-Entropy Word Scanning (for unformatted raw tokens)
-	words := strings.Fields(output)
-	for _, w := range words {
-		// Clean trailing punctuation
-		cleaned := strings.Trim(w, `"',;:()[]{}<>`)
-		if strings.HasPrefix(cleaned, "[SECRET_REF_") && strings.HasSuffix(cleaned, "]") {
+	// 3. Third Pass: Delimiter-Aware & Sliding-Window High-Entropy Scanning
+	segments := extractCandidateSegments(output)
+	// Replace longer segments first to avoid corrupting superstrings.
+	sort.Slice(segments, func(i, j int) bool {
+		return len(segments[i]) > len(segments[j])
+	})
+	for _, seg := range segments {
+		if !strings.Contains(output, seg) {
 			continue
 		}
-		if IsHighEntropy(cleaned, e.cfg.MinEntropyLen, e.cfg.EntropyThreshold) {
-			ref := tm.Add(cleaned, "High-Entropy Token")
-			output = strings.ReplaceAll(output, cleaned, ref)
+		if IsHighEntropy(seg, e.cfg.MinEntropyLen, e.cfg.EntropyThreshold) {
+			ref := tm.Add(seg, "High-Entropy Token")
+			output = strings.ReplaceAll(output, seg, ref)
 		}
 	}
 
-	return output, tm, nil
+	return output, nil
 }
 
 // Restore substitutes all placeholder tokens in text back to their original secret values.
@@ -155,10 +263,10 @@ func (e *Engine) Restore(text string, tm *TokenMap) string {
 func (e *Engine) FailClosedWireGuard(payload []byte) error {
 	s := normalizeInvisibleChars(string(payload))
 
-	// 1. Vault credentials check
-	for name, secret := range e.cfg.CustomVaultKeys {
-		if len(secret) >= 4 && strings.Contains(s, secret) {
-			return fmt.Errorf("%w: matched custom vault key %s", ErrSecretLeakageDetected, name)
+	// 1. Vault credentials check (sorted descending)
+	for _, entry := range e.sortedVaultEntries() {
+		if strings.Contains(s, entry.secret) {
+			return fmt.Errorf("%w: matched custom vault key %s", ErrSecretLeakageDetected, entry.name)
 		}
 	}
 
@@ -168,15 +276,25 @@ func (e *Engine) FailClosedWireGuard(payload []byte) error {
 			matches := p.Regex.FindAllStringSubmatch(s, -1)
 			for _, m := range matches {
 				if len(m) > 1 && len(m[1]) > 0 {
-					if !strings.HasPrefix(m[1], "[SECRET_REF_") {
+					if !isNonSecretAssignmentValue(m[1]) {
 						return fmt.Errorf("%w: unshielded credential in %s", ErrSecretLeakageDetected, p.Name)
 					}
 				}
 			}
 		} else {
-			if p.Regex.MatchString(s) {
-				return fmt.Errorf("%w: matched %s", ErrSecretLeakageDetected, p.Name)
+			matches := p.Regex.FindAllString(s, -1)
+			for _, m := range matches {
+				if !strings.Contains(m, "[SECRET_REF_") {
+					return fmt.Errorf("%w: matched %s", ErrSecretLeakageDetected, p.Name)
+				}
 			}
+		}
+	}
+
+	// 3. Delimiter-aware & sliding-window high-entropy token check
+	for _, seg := range extractCandidateSegments(s) {
+		if IsHighEntropy(seg, e.cfg.MinEntropyLen, e.cfg.EntropyThreshold) {
+			return fmt.Errorf("%w: high-entropy secret segment escaped redaction", ErrSecretLeakageDetected)
 		}
 	}
 

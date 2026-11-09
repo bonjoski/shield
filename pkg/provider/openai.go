@@ -5,16 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
 type OpenAIProvider struct {
-	apiKey     string
-	model      string
-	baseURL    string
-	httpClient *http.Client
+	apiKey        string
+	model         string
+	baseURL       string
+	httpClient    *http.Client
+	allowLoopback bool
 }
 
 func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvider {
@@ -28,8 +29,16 @@ func NewOpenAIProvider(apiKey string, model string, baseURL string) *OpenAIProvi
 		apiKey:     apiKey,
 		model:      model,
 		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: NewSafeHTTPClient(60*time.Second, false),
 	}
+}
+
+// NewOpenAIProviderForTest creates an OpenAIProvider allowing explicit loopback test servers (e.g. httptest.NewServer).
+func NewOpenAIProviderForTest(apiKey string, model string, baseURL string) *OpenAIProvider {
+	p := NewOpenAIProvider(apiKey, model, baseURL)
+	p.allowLoopback = true
+	p.httpClient = NewSafeHTTPClient(10*time.Second, true)
+	return p
 }
 
 func (o *OpenAIProvider) Name() string {
@@ -69,6 +78,14 @@ func (o *OpenAIProvider) Complete(ctx context.Context, req Request) (*Response, 
 	if model == "" {
 		model = o.model
 	}
+	if err := ValidateModelName(model); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
+	}
+
+	cleanBase, err := ValidateBaseURL(o.baseURL, o.allowLoopback, !o.allowLoopback)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
+	}
 
 	messages := make([]openAIChatMessage, 0, len(req.Messages)+1)
 	if req.SystemPrompt != "" {
@@ -95,10 +112,10 @@ func (o *OpenAIProvider) Complete(ctx context.Context, req Request) (*Response, 
 		return nil, fmt.Errorf("openai marshal error: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/chat/completions", o.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	endpoint := fmt.Sprintf("%s/chat/completions", strings.TrimRight(cleanBase, "/"))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("openai request creation failed: %w", err)
+		return nil, fmt.Errorf("openai request creation failed: %w", sanitizeTransportError(err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if o.apiKey != "" {
@@ -107,18 +124,18 @@ func (o *OpenAIProvider) Complete(ctx context.Context, req Request) (*Response, 
 
 	httpResp, err := o.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrProviderFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, sanitizeTransportError(err))
 	}
 	defer httpResp.Body.Close()
 
-	respBytes, err := io.ReadAll(httpResp.Body)
+	respBytes, err := ReadBoundedBody(httpResp.Body, MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("openai read response failed: %w", err)
 	}
 
 	var oResp openAIChatResponse
 	if err := json.Unmarshal(respBytes, &oResp); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 
 	if oResp.Error != nil {

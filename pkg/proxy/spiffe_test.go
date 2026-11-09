@@ -372,14 +372,16 @@ func TestSPIFFE_ClientWithoutCertificate(t *testing.T) {
 
 	certFile := filepath.Join(tempDir, "server.crt")
 	keyFile := filepath.Join(tempDir, "server.key")
+	caFile := filepath.Join(tempDir, "ca.crt")
 	_ = os.WriteFile(certFile, serverCertPEM, 0600)
 	_ = os.WriteFile(keyFile, serverKeyPEM, 0600)
+	_ = os.WriteFile(caFile, caCertPEM, 0644)
 
 	engine := shield.NewEngine(shield.DefaultConfig())
 	mock := provider.NewMockProvider("mock-ai", "OK")
 
-	// Server with AllowedSPIFFEIDs and TLS, but no ClientCA (ClientAuth = RequestClientCert)
-	srv := NewServerWithOptions(Options{
+	// 1. Server with AllowedSPIFFEIDs and TLS, but NO ClientCA must refuse startup (SHD-01)
+	insecureSrv := NewServerWithOptions(Options{
 		Addr:             "127.0.0.1:0",
 		TLS:              true,
 		CertFile:         certFile,
@@ -387,15 +389,29 @@ func TestSPIFFE_ClientWithoutCertificate(t *testing.T) {
 		AllowedSPIFFEIDs: []string{"spiffe://bonjoski.local/ns/dev/*"},
 	}, engine, mock)
 
+	if err := insecureSrv.Start(); err == nil {
+		_ = insecureSrv.Stop(context.Background())
+		t.Fatalf("expected server startup to fail when AllowedSPIFFEIDs is configured without ClientCA")
+	}
+
+	// 2. Server with AllowedSPIFFEIDs AND ClientCA rejects client without certificate at mTLS layer
+	srv := NewServerWithOptions(Options{
+		Addr:             "127.0.0.1:0",
+		TLS:              true,
+		CertFile:         certFile,
+		KeyFile:          keyFile,
+		ClientCA:         caFile,
+		AllowedSPIFFEIDs: []string{"spiffe://bonjoski.local/ns/dev/*"},
+	}, engine, mock)
+
 	if err := srv.Start(); err != nil {
-		t.Fatalf("failed to start server: %v", err)
+		t.Fatalf("failed to start mTLS SPIFFE server: %v", err)
 	}
 	defer srv.Stop(context.Background())
 
 	caPool := x509.NewCertPool()
 	caPool.AppendCertsFromPEM(caCertPEM)
 
-	// Client without certificate
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -404,13 +420,10 @@ func TestSPIFFE_ClientWithoutCertificate(t *testing.T) {
 		},
 	}
 
-	resp, body := makeChatRequest(t, client, srv.ListenerAddr().String())
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("expected 403 Forbidden, got %d: %v", resp.StatusCode, body)
-	}
-
-	if body["error"] != "client certificate required" {
-		t.Errorf("expected error 'client certificate required', got %v", body["error"])
+	reqPayload := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`
+	_, err := client.Post("https://"+srv.ListenerAddr().String()+"/v1/chat/completions", "application/json", bytes.NewReader([]byte(reqPayload)))
+	if err == nil {
+		t.Fatalf("expected mTLS handshake failure when client omits certificate")
 	}
 }
 

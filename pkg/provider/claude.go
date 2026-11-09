@@ -5,17 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
 type ClaudeProvider struct {
-	apiKey     string
-	model      string
-	httpClient *http.Client
-	baseURL    string
+	apiKey        string
+	model         string
+	httpClient    *http.Client
+	baseURL       string
+	allowLoopback bool
 }
 
 func NewClaudeProvider(apiKey string, model string) *ClaudeProvider {
@@ -25,7 +25,7 @@ func NewClaudeProvider(apiKey string, model string) *ClaudeProvider {
 	return &ClaudeProvider{
 		apiKey:     apiKey,
 		model:      model,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: NewSafeHTTPClient(60*time.Second, false),
 		baseURL:    "https://api.anthropic.com/v1",
 	}
 }
@@ -77,6 +77,14 @@ func (c *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, 
 	if model == "" {
 		model = c.model
 	}
+	if err := ValidateModelName(model); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
+	}
+
+	cleanBase, err := ValidateBaseURL(c.baseURL, c.allowLoopback, !c.allowLoopback)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, err)
+	}
 
 	maxTokens := req.MaxTokens
 	if maxTokens == 0 {
@@ -107,10 +115,10 @@ func (c *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, 
 		return nil, fmt.Errorf("claude marshal error: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/messages", c.baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	endpoint := fmt.Sprintf("%s/messages", cleanBase)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("claude request creation failed: %w", err)
+		return nil, fmt.Errorf("claude request creation failed: %w", sanitizeTransportError(err))
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", c.apiKey)
@@ -118,18 +126,18 @@ func (c *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, 
 
 	httpResp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrProviderFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrProviderFailed, sanitizeTransportError(err))
 	}
 	defer httpResp.Body.Close()
 
-	respBytes, err := io.ReadAll(httpResp.Body)
+	respBytes, err := ReadBoundedBody(httpResp.Body, MaxUpstreamResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("claude read response failed: %w", err)
 	}
 
 	var cResp claudeResponse
 	if err := json.Unmarshal(respBytes, &cResp); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 
 	if cResp.Error != nil {
