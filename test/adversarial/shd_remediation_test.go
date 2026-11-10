@@ -130,7 +130,7 @@ func decodePEMCert(t *testing.T, certPEM []byte) (*x509.Certificate, error) {
 // 2. Invalid `req.Model` values containing `?`, `/`, `..`, `&` are rejected before URL construction.
 // 3. Proxy 502 error responses never leak upstream URLs, query parameters, or API keys.
 func TestSHD02_GeminiHeaderAuthModelValidationAndSanitized502(t *testing.T) {
-	const secretGeminiKey = "AIzaSySecretGeminiApiKeyValue1234567890"
+	const secretGeminiKey = "mock-gemini-test-key-shd02-remediation"
 	var gotHeaderKey, gotRawQuery, gotPath string
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
