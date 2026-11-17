@@ -53,6 +53,8 @@ func main() {
 	switch cmd {
 	case "proxy":
 		runProxy(os.Args[2:])
+	case "gateway":
+		runGateway(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "db":
@@ -89,6 +91,15 @@ Commands:
              --spiffe-acl <ids>         Comma-separated list of allowed SPIFFE IDs or wildcard patterns
              --provider <name>          AI Provider (gemini, claude, openai, ollama, mock)
              --model <model>            Model override
+  gateway  Start the Keyless AI Gateway Adapter (RFC-2026-11-16-35)
+           Flags:
+             --listen <host:port>       TCP address to bind (default: 127.0.0.1:8080)
+             --upstream <url>           Upstream AI model provider API URL (default: https://api.openai.com/v1)
+             --vault-secret <name>      Locksmith vault secret name (default: openai/api-key)
+             --socket <path>            Unix domain socket path for incoming requests (optional)
+             --auth-token <token>       Local client bearer auth token (optional)
+             --locksmith-socket <path>  Locksmith daemon UDS socket path (optional)
+             --pid-file <path>          Path to write PID file (optional)
   status   Check running status and health of the Shield proxy daemon
            Flags:
              --addr <addr>              TCP address to check (default: 127.0.0.1:8443, 127.0.0.1:8080)

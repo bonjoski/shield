@@ -37,3 +37,42 @@ func TestSHD03_BuildDBTokenVerifierFailClosed(t *testing.T) {
 		t.Fatalf("expected explicit insecure opt-in to construct dev verifier, got err=%v", err)
 	}
 }
+
+func TestGateway_CLIParseFlags(t *testing.T) {
+	args := []string{
+		"--listen", "127.0.0.1:9090",
+		"--upstream", "https://api.anthropic.com/v1",
+		"--vault-secret", "anthropic/api-key",
+		"--socket", "~/.shield/test-gw.sock",
+		"--auth-token", "my-secret-token",
+		"--locksmith-socket", "/tmp/locksmith.sock",
+		"--pid-file", "/tmp/gateway.pid",
+	}
+
+	cfg, pidFile, err := parseGatewayConfig(args)
+	if err != nil {
+		t.Fatalf("failed to parse gateway args: %v", err)
+	}
+
+	if cfg.ListenAddr != "127.0.0.1:9090" {
+		t.Errorf("ListenAddr = %s, want 127.0.0.1:9090", cfg.ListenAddr)
+	}
+	if cfg.UpstreamURL != "https://api.anthropic.com/v1" {
+		t.Errorf("UpstreamURL = %s, want https://api.anthropic.com/v1", cfg.UpstreamURL)
+	}
+	if cfg.VaultSecret != "anthropic/api-key" {
+		t.Errorf("VaultSecret = %s, want anthropic/api-key", cfg.VaultSecret)
+	}
+	if cfg.SocketPath != "~/.shield/test-gw.sock" {
+		t.Errorf("SocketPath = %s, want ~/.shield/test-gw.sock", cfg.SocketPath)
+	}
+	if cfg.AuthToken != "my-secret-token" {
+		t.Errorf("AuthToken = %s, want my-secret-token", cfg.AuthToken)
+	}
+	if cfg.LocksmithSocket != "/tmp/locksmith.sock" {
+		t.Errorf("LocksmithSocket = %s, want /tmp/locksmith.sock", cfg.LocksmithSocket)
+	}
+	if pidFile != "/tmp/gateway.pid" {
+		t.Errorf("pidFile = %s, want /tmp/gateway.pid", pidFile)
+	}
+}

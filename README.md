@@ -1,5 +1,9 @@
 # `Shield`
 
+[![CI](https://github.com/bonjoski/shield/actions/workflows/ci.yml/badge.svg)](https://github.com/bonjoski/shield/actions/workflows/ci.yml)
+[![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 > **Sovereign Client-Side Secret Shielding & Fail-Closed Wire Guard for AI Agents**  
 > Part of the `bonjoski` sovereign AI agent security ecosystem.
 
@@ -72,6 +76,22 @@ Shield includes rigorous adversarial test coverage (`test/adversarial/`):
 Run the adversarial test suite:
 ```bash
 go test -v ./test/adversarial
+```
+
+---
+
+## SLSA Provenance & Verification
+
+Shield adheres to the **SLSA v1.0** specification.
+
+Verify provenance with GitHub CLI:
+```bash
+gh attestation verify shield --repo bonjoski/shield
+```
+
+Or verify offline using Soulcaster:
+```bash
+soulcaster verify --attestation shield.intoto.jsonl bin/shield
 ```
 
 ---
