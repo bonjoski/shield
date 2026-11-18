@@ -52,6 +52,18 @@ Output:
 
 ---
 
+## 💡 Core Use Cases & Recipes
+
+Every primary developer use case is backed by dedicated, copy-pasteable recipes in [**`docs/use-cases/`**](docs/use-cases/README.md):
+
+| Use Case | Scenario & Quick Recipe | Full Guide |
+| :--- | :--- | :--- |
+| **Outbound Prompt Secret Redaction** | Redact API keys and passwords before prompt transit over loopback:<br/>`shield proxy --port 8080` (with `HTTP_PROXY=http://127.0.0.1:8080`) | [Guide](docs/use-cases/01-prompt-secret-redaction.md) |
+| **Loopback SSRF Prevention Gateway** | Prevent autonomous web agents from probing local ports (`127.0.0.1`):<br/>`shield gateway start --block-internal` | [Guide](docs/use-cases/02-loopback-ssrf-prevention.md) |
+| **CLI Entropy Scanner & Redaction** | Rapidly scan text, logs, or git diffs for high-entropy secrets from CLI:<br/>`shield redact <input>` | [Guide](docs/use-cases/03-cli-entropy-scanner.md) |
+
+---
+
 ## Integrations
 
 Shield seamlessly connects with your agent and developer workflows:
