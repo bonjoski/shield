@@ -4,7 +4,10 @@
 [![SLSA 2](https://slsa.dev/images/gh-badge-level2.svg)](https://slsa.dev)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-> **Sovereign Client-Side Secret Shielding & Fail-Closed Wire Guard for AI Agents**  
+> [!NOTE]
+> **Developer Tooling & Safe Harbor Scope**: Shield is strictly an unmanaged, local-workstation developer utility running exclusively on localhost (`127.0.0.1:8080`) and as a CLI pipe filter for personal API key shielding. It is not an enterprise AI DLP platform, cloud reverse proxy, or corporate network security gateway.
+
+> **Local Workstation Secret Shielding & Loopback Wire Guard**  
 > Part of the `bonjoski` sovereign AI agent security ecosystem.
 
 ---
